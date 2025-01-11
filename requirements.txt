@@ -4,3 +4,4 @@ jupyter
 tensorflow
 rasterio
 requests
+shapely

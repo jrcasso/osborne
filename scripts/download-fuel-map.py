@@ -2,19 +2,21 @@
 """
 Script: eros_nlcd_download.py
 Purpose: Demonstrates how to connect to the USGS EROS M2M API using an API token,
-         search for NLCD data within a bounding box, and download the resulting file.
+         parse a bounding box from a GeoJSON file, search for NLCD data within that
+         bounding box, and download the resulting file.
 
 Requirements:
-  - pip install requests
+  - pip install requests shapely
   - A valid EROS API token in your environment (EROS_API_TOKEN)
 
 Usage:
   export EROS_API_TOKEN="your_api_key"
-  python eros_nlcd_download.py --bbox -120.5 35.0 -120.0 35.5 --out_dir /path/to/downloads
+  python eros_nlcd_download.py --geojson region.geojson --out_dir /path/to/downloads
 
 Note:
-  Replace 'NLCD2019_ID' with the correct dataset identifier and possibly
-  'LANDSAT_ARCHIVE' references with the correct 'node' for NLCD on EROS.
+  - Replace 'NLCD2019_ID' with the correct dataset ID for NLCD in M2M.
+  - Replace 'LANDSAT_ARCHIVE' (or 'HDDS', 'DP', etc.) with the correct node for NLCD.
+  - If the dataset is distributed as one giant mosaic, you may get only a single scene.
 """
 
 import os
@@ -23,13 +25,15 @@ import argparse
 import requests
 import json
 
+from shapely.geometry import shape, MultiPolygon, Polygon
+from shapely.ops import unary_union
+
 # EROS (M2M) base URL
 EROS_M2M_URL = "https://m2m.cr.usgs.gov/api/api/json/stable/"
 
 # MOCK dataset & node definitions: you must update these for real usage
 NLCD_DATASET_ID = "NLCD2019_ID"   # <-- Replace with the actual dataset ID for NLCD 2019
 NLCD_NODE = "LANDSAT_ARCHIVE"     # <-- Or 'HDDS' or other node if that's where NLCD is stored
-PRODUCT_TYPE = "products"         # Sometimes called "productList", but depends on the dataset
 
 def get_api_key():
     """
@@ -40,7 +44,6 @@ def get_api_key():
         print("Error: EROS_API_TOKEN environment variable not set.")
         sys.exit(1)
     return token
-
 
 def api_post(endpoint, payload, api_key):
     """
@@ -56,17 +59,61 @@ def api_post(endpoint, payload, api_key):
     response.raise_for_status()
     return response.json()
 
+def parse_geojson_bbox(geojson_file):
+    """
+    Parses a GeoJSON file, extracts all Polygon/MultiPolygon features,
+    and returns the bounding box of their union in (min_lon, min_lat, max_lon, max_lat) format.
+    """
+    with open(geojson_file, 'r') as f:
+        data = json.load(f)
+
+    # Depending on the GeoJSON structure, we need to collect polygons from:
+    # - FeatureCollection
+    # - Single Feature
+    # - Or a direct geometry (less common for standard GeoJSON)
+    
+    geometries = []
+    
+    if 'type' not in data:
+        raise ValueError("Invalid GeoJSON: missing 'type' field.")
+    
+    if data['type'] == 'FeatureCollection':
+        for feature in data['features']:
+            geom = shape(feature['geometry'])
+            geometries.append(geom)
+    elif data['type'] == 'Feature':
+        geom = shape(data['geometry'])
+        geometries.append(geom)
+    else:
+        # Could be a direct geometry object
+        geom = shape(data)
+        geometries.append(geom)
+    
+    # Union all polygons
+    if len(geometries) == 1:
+        union_geom = geometries[0]
+    else:
+        union_geom = unary_union(geometries)
+
+    if not union_geom.is_valid:
+        union_geom = union_geom.buffer(0)  # attempt to fix geometry if needed
+
+    # If the result is a polygon (or multi), we can get its bounds
+    if isinstance(union_geom, (Polygon, MultiPolygon)):
+        minx, miny, maxx, maxy = union_geom.bounds
+        return (minx, miny, maxx, maxy)
+    else:
+        raise ValueError("GeoJSON does not contain valid polygon geometry.")
 
 def search_nlcd(bbox, api_key, max_results=5):
     """
     Search the M2M API for NLCD items within a bounding box.
-    bbox = (min_long, min_lat, max_long, max_lat)
+    bbox = (min_lon, min_lat, max_lon, max_lat)
     """
     minX, minY, maxX, maxY = bbox
 
-    # The M2M 'search' request typically looks like this:
+    # The M2M 'search' request. 
     # Reference: https://m2m.cr.usgs.gov/api/docs/#search
-    # Using minimal bounding rectangle (mBR).
     search_payload = {
         "datasetName": NLCD_DATASET_ID,
         "node": NLCD_NODE,
@@ -90,17 +137,13 @@ def search_nlcd(bbox, api_key, max_results=5):
     search_result = api_post("scene-search", search_payload, api_key)
     return search_result
 
-
 def download_scene(scene_entity_id, api_key, out_dir):
     """
     Download a scene by:
-      1) Requesting a download token or direct download link
-      2) Saving the file to out_dir
-
-    The M2M flow often requires:
-      - "download-options" to see what's available
-      - "download-request" to stage the file
-      - then retrieve the link from "download-retrieve"
+      1) Requesting available download options
+      2) Staging the download
+      3) Retrieving the direct link (if immediately available)
+      4) Saving to out_dir
     """
     # 1) Check available downloads
     download_options_payload = {
@@ -110,13 +153,11 @@ def download_scene(scene_entity_id, api_key, out_dir):
     }
     download_opts = api_post("download-options", download_options_payload, api_key)
     
-    # The returned structure typically includes product info. 
-    # We pick the first or relevant product. This might vary for NLCD.
-    if not download_opts:
+    if not download_opts or 'data' not in download_opts:
         print("[WARN] No download options returned for scene:", scene_entity_id)
         return None
     
-    # Each item in download_opts can have something like 'downloadId' or 'productId'
+    # If multiple items are returned, pick the first available
     product_id = None
     for item in download_opts['data']:
         if item.get('available'):
@@ -139,12 +180,10 @@ def download_scene(scene_entity_id, api_key, out_dir):
         ]
     }
     download_request_resp = api_post("download-request", download_request_payload, api_key)
-    if not download_request_resp['data']:
+    if not download_request_resp.get('data'):
         print("[ERROR] Could not stage download for scene:", scene_entity_id)
         return None
     
-    # The result might have a 'preparingDownloads' or 'availableDownloads' list.
-    # Some items may need a "check again later" loop if the file is being prepared.
     available_downloads = download_request_resp['data'].get('availableDownloads', [])
     preparing_downloads = download_request_resp['data'].get('preparingDownloads', [])
     
@@ -152,10 +191,9 @@ def download_scene(scene_entity_id, api_key, out_dir):
     if available_downloads:
         download_url = available_downloads[0]['url']
     else:
-        print("[INFO] Download is being prepared. This script doesn't implement a wait loop.")
-        print("      You may need to poll 'download-retrieve' or revisit 'download-request'.")
+        print("[INFO] Download is being prepared; no immediate link available.")
         if preparing_downloads:
-            print("[INFO] Items in preparing:", preparing_downloads)
+            print("[INFO] Scenes in 'preparing' status:", preparing_downloads)
         return None
     
     # 3) Download the file
@@ -168,14 +206,14 @@ def download_scene(scene_entity_id, api_key, out_dir):
         with open(local_filename, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
-    print("[INFO] Download complete.")
+    
+    print("[INFO] Download complete:", local_filename)
     return local_filename
 
-
 def main():
-    parser = argparse.ArgumentParser(description="USGS EROS M2M API: Search and Download NLCD Scenes.")
-    parser.add_argument("--bbox", type=float, nargs=4, required=True,
-                        help="Bounding box: minLon minLat maxLon maxLat")
+    parser = argparse.ArgumentParser(description="USGS EROS M2M API: Search and Download NLCD Scenes using a GeoJSON bounding box.")
+    parser.add_argument("--geojson", type=str, required=True,
+                        help="Path to a GeoJSON file containing polygon(s).")
     parser.add_argument("--out_dir", type=str, default="downloads",
                         help="Output directory for downloaded data.")
     args = parser.parse_args()
@@ -183,26 +221,30 @@ def main():
     # 1) Get API key from environment
     api_key = get_api_key()
     
-    # 2) Search
-    search_result = search_nlcd(bbox=args.bbox, api_key=api_key)
+    # 2) Parse bounding box from GeoJSON
+    bbox = parse_geojson_bbox(args.geojson)
+    print(f"[INFO] Parsed bounding box from GeoJSON: {bbox}")
+    
+    # 3) Search
+    search_result = search_nlcd(bbox=bbox, api_key=api_key, max_results=10)
     if 'data' not in search_result:
         print("[ERROR] Unexpected search response:", search_result)
         sys.exit(1)
     
     if 'results' not in search_result['data'] or not search_result['data']['results']:
-        print("[INFO] No scenes found in the specified bounding box.")
+        print("[INFO] No scenes found in the specified region.")
         sys.exit(0)
     
-    # 3) Iterate over found scenes, attempt to download
-    print(f"[INFO] Found {len(search_result['data']['results'])} scene(s). Downloading:")
-    for idx, scene in enumerate(search_result['data']['results']):
+    scenes = search_result['data']['results']
+    print(f"[INFO] Found {len(scenes)} scene(s). Downloading up to {len(scenes)} scene(s).")
+    
+    # 4) Download each scene
+    for idx, scene in enumerate(scenes):
         scene_id = scene['entityId']
         scene_name = scene.get('displayId', 'UnknownNLCDScene')
         print(f"  {idx+1}. Scene ID: {scene_id}  Name: {scene_name}")
         
-        # Attempt download
         download_scene(scene_id, api_key, args.out_dir)
-
 
 if __name__ == "__main__":
     main()
