@@ -1,3 +1,6 @@
 ipykernel
 notebook
 jupyter
+tensorflow
+rasterio
+requests
